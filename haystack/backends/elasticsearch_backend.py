@@ -183,7 +183,7 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
                 if not self.silently_fail:
                     raise
 
-                self.log.error("Failed to remove document '%s' from Elasticsearch: %s", doc_id, e)
+                self.log.info("Failed to remove document '%s' from Elasticsearch: %s", doc_id, e)
                 return
 
         try:
@@ -195,7 +195,7 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
             if not self.silently_fail:
                 raise
 
-            self.log.error("Failed to remove document '%s' from Elasticsearch: %s", doc_id, e)
+            self.log.info("Failed to remove document '%s' from Elasticsearch: %s", doc_id, e)
 
     def clear(self, models=[], commit=True):
         # We actually don't want to do this here, as mappings could be
