@@ -1,25 +1,34 @@
+from __future__ import unicode_literals
+
 import datetime
+import re
 import warnings
+
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.db.models.loading import get_model
+from django.utils import six
+
 import haystack
 from haystack.backends import BaseEngine, BaseSearchBackend, BaseSearchQuery, log_query
-from haystack.constants import ID, DJANGO_CT, DJANGO_ID, DEFAULT_OPERATOR
+from haystack.constants import DEFAULT_OPERATOR, DJANGO_CT, DJANGO_ID, ID
 from haystack.exceptions import MissingDependency, MoreLikeThisError
-from haystack.inputs import PythonData, Clean, Exact
+from haystack.inputs import Clean, Exact, PythonData, Raw
 from haystack.models import SearchResult
-from haystack.utils import get_identifier
 from haystack.utils import log as logging
+from haystack.utils import get_identifier, get_model_ct
 
 try:
-    import requests
+    import elasticsearch
+    from elasticsearch.helpers import bulk_index
+    from elasticsearch.exceptions import NotFoundError
 except ImportError:
-    raise MissingDependency("The 'elasticsearch' backend requires the installation of 'requests'.")
-try:
-    import pyelasticsearch
-except ImportError:
-    raise MissingDependency("The 'elasticsearch' backend requires the installation of 'pyelasticsearch'. Please refer to the documentation.")
+    raise MissingDependency("The 'elasticsearch' backend requires the installation of 'elasticsearch'. Please refer to the documentation.")
+
+
+DATETIME_REGEX = re.compile(
+    r'^(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})T'
+    r'(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})(\.\d+)?$')
 
 
 class ElasticsearchSearchBackend(BaseSearchBackend):
@@ -35,7 +44,7 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
     # The '\\' must come first, so as not to overwrite the other slash replacements.
     RESERVED_CHARACTERS = (
         '\\', '+', '-', '&&', '||', '!', '(', ')', '{', '}',
-        '[', ']', '^', '"', '~', '*', '?', ':',
+        '[', ']', '^', '"', '~', '*', '?', ':', '/',
     )
 
     # Settings to add an n-gram & edge n-gram analyzer.
@@ -92,7 +101,7 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
         if not 'INDEX_NAME' in connection_options:
             raise ImproperlyConfigured("You must specify a 'INDEX_NAME' in your settings for connection '%s'." % connection_alias)
 
-        self.conn = pyelasticsearch.ElasticSearch(connection_options['URL'], timeout=self.timeout)
+        self.conn = elasticsearch.Elasticsearch(connection_options['URL'], timeout=self.timeout, **connection_options.get('KWARGS', {}))
         self.index_name = connection_options['INDEX_NAME']
         self.log = logging.getLogger('haystack')
         self.setup_complete = False
@@ -106,7 +115,9 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
         # during the ``update`` & if it doesn't match, we'll put the new
         # mapping.
         try:
-            self.existing_mapping = self.conn.get_mapping(index=self.index_name)
+            self.existing_mapping = self.conn.indices.get_mapping(index=self.index_name)
+        except NotFoundError:
+            pass
         except Exception:
             if not self.silently_fail:
                 raise
@@ -115,15 +126,19 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
         self.content_field_name, field_mapping = self.build_schema(unified_index.all_searchfields())
         current_mapping = {
             'modelresult': {
-                'properties': field_mapping
+                'properties': field_mapping,
+                '_boost': {
+                    'name': 'boost',
+                    'null_value': 1.0
+                }
             }
         }
 
         if current_mapping != self.existing_mapping:
             try:
                 # Make sure the index is there first.
-                self.conn.create_index(self.index_name, self.DEFAULT_SETTINGS)
-                self.conn.put_mapping('modelresult', current_mapping, index=self.index_name)
+                self.conn.indices.create(index=self.index_name, body=self.DEFAULT_SETTINGS, ignore=400)
+                self.conn.indices.put_mapping(index=self.index_name, doc_type='modelresult', body=current_mapping)
                 self.existing_mapping = current_mapping
             except Exception:
                 if not self.silently_fail:
@@ -135,7 +150,7 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
         if not self.setup_complete:
             try:
                 self.setup()
-            except (requests.RequestException, pyelasticsearch.ElasticHttpError), e:
+            except elasticsearch.TransportError as e:
                 if not self.silently_fail:
                     raise
 
@@ -151,27 +166,28 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
 
                 # Convert the data to make sure it's happy.
                 for key, value in prepped_data.items():
-                    final_data[key] = self.conn.from_python(value)
+                    final_data[key] = self._from_python(value)
+                final_data['_id'] = final_data[ID]
 
                 prepped_docs.append(final_data)
-            except (requests.RequestException, pyelasticsearch.ElasticHttpError), e:
+            except elasticsearch.TransportError as e:
                 if not self.silently_fail:
                     raise
 
                 # We'll log the object identifier but won't include the actual object
                 # to avoid the possibility of that generating encoding errors while
                 # processing the log message:
-                self.log.error(u"%s while preparing object for update" % e.__name__, exc_info=True, extra={
+                self.log.error(u"%s while preparing object for update" % e.__class__.__name__, exc_info=True, extra={
                     "data": {
                         "index": index,
                         "object": get_identifier(obj)
                     }
                 })
 
-        self.conn.bulk_index(self.index_name, 'modelresult', prepped_docs, id_field=ID)
+        bulk_index(self.conn, prepped_docs, index=self.index_name, doc_type='modelresult')
 
         if commit:
-            self.conn.refresh(index=self.index_name)
+            self.conn.indices.refresh(index=self.index_name)
 
     def remove(self, obj_or_string, commit=True):
         doc_id = get_identifier(obj_or_string)
@@ -179,7 +195,7 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
         if not self.setup_complete:
             try:
                 self.setup()
-            except (requests.RequestException, pyelasticsearch.ElasticHttpError), e:
+            except elasticsearch.TransportError as e:
                 if not self.silently_fail:
                     raise
 
@@ -187,11 +203,11 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
                 return
 
         try:
-            self.conn.delete(self.index_name, 'modelresult', doc_id)
+            self.conn.delete(index=self.index_name, doc_type='modelresult', id=doc_id, ignore=404)
 
             if commit:
-                self.conn.refresh(index=self.index_name)
-        except (requests.RequestException, pyelasticsearch.ElasticHttpError), e:
+                self.conn.indices.refresh(index=self.index_name)
+        except elasticsearch.TransportError as e:
             if not self.silently_fail:
                 raise
 
@@ -205,21 +221,20 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
 
         try:
             if not models:
-                self.conn.delete_index(self.index_name)
+                self.conn.indices.delete(index=self.index_name, ignore=404)
+                self.setup_complete = False
+                self.existing_mapping = {}
             else:
                 models_to_delete = []
 
                 for model in models:
-                    models_to_delete.append("%s:%s.%s" % (DJANGO_CT, model._meta.app_label, model._meta.module_name))
+                    models_to_delete.append("%s:%s" % (DJANGO_CT, get_model_ct(model)))
 
                 # Delete by query in Elasticsearch asssumes you're dealing with
                 # a ``query`` root object. :/
-                query = {'query_string': {'query': " OR ".join(models_to_delete)}}
-                self.conn.delete_by_query(self.index_name, 'modelresult', query)
-
-            if commit:
-                self.conn.refresh(index=self.index_name)
-        except (requests.RequestException, pyelasticsearch.ElasticHttpError), e:
+                query = {'query': {'query_string': {'query': " OR ".join(models_to_delete)}}}
+                self.conn.delete_by_query(index=self.index_name, doc_type='modelresult', body=query)
+        except elasticsearch.TransportError as e:
             if not self.silently_fail:
                 raise
 
@@ -241,29 +256,24 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
         if query_string == '*:*':
             kwargs = {
                 'query': {
-                    'filtered': {
-                        'query': {
-                            "match_all": {}
-                        },
-                    },
+                    "match_all": {}
                 },
             }
         else:
             kwargs = {
                 'query': {
-                    'filtered': {
-                        'query': {
-                            'query_string': {
-                                'default_field': content_field,
-                                'default_operator': DEFAULT_OPERATOR,
-                                'query': query_string,
-                                'analyze_wildcard': True,
-                                'auto_generate_phrase_queries': True,
-                            },
-                        },
+                    'query_string': {
+                        'default_field': content_field,
+                        'default_operator': DEFAULT_OPERATOR,
+                        'query': query_string,
+                        'analyze_wildcard': True,
+                        'auto_generate_phrase_queries': True,
                     },
                 },
             }
+
+        # so far, no filters
+        filters = []
 
         if fields:
             if isinstance(fields, (list, set)):
@@ -309,8 +319,16 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
                 }
             }
 
-        if self.include_spelling is True:
-            warnings.warn("Elasticsearch does not handle spelling suggestions.", Warning, stacklevel=2)
+        if self.include_spelling:
+            kwargs['suggest'] = {
+                'suggest': {
+                    'text': spelling_query or query_string,
+                    'term': {
+                        # Using content_field here will result in suggestions of stemmed words.
+                        'field': '_all',
+                    },
+                },
+            }
 
         if narrow_queries is None:
             narrow_queries = set()
@@ -318,13 +336,21 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
         if facets is not None:
             kwargs.setdefault('facets', {})
 
-            for facet_fieldname in facets:
-                kwargs['facets'][facet_fieldname] = {
+            for facet_fieldname, extra_options in facets.items():
+                facet_options = {
                     'terms': {
                         'field': facet_fieldname,
                         'size': 100,
                     },
                 }
+                # Special cases for options applied at the facet level (not the terms level).
+                if extra_options.pop('global_scope', False):
+                    # Renamed "global_scope" since "global" is a python keyword.
+                    facet_options['global'] = True
+                if 'facet_filter' in extra_options:
+                    facet_options['facet_filter'] = extra_options.pop('facet_filter')
+                facet_options['terms'].update(extra_options)
+                kwargs['facets'][facet_fieldname] = facet_options
 
         if date_facets is not None:
             kwargs.setdefault('facets', {})
@@ -346,8 +372,8 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
                     'facet_filter': {
                         "range": {
                             facet_fieldname: {
-                                'from': self.conn.from_python(value.get('start_date')),
-                                'to': self.conn.from_python(value.get('end_date')),
+                                'from': self._from_python(value.get('start_date')),
+                                'to': self._from_python(value.get('end_date')),
                             }
                         }
                     }
@@ -369,7 +395,7 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
             limit_to_registered_models = getattr(settings, 'HAYSTACK_LIMIT_TO_REGISTERED_MODELS', True)
 
         if models and len(models):
-            model_choices = sorted(['%s.%s' % (model._meta.app_label, model._meta.module_name) for model in models])
+            model_choices = sorted(get_model_ct(model) for model in models)
         elif limit_to_registered_models:
             # Using narrow queries, limit the results to only models handled
             # with the current routers.
@@ -378,55 +404,39 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
             model_choices = []
 
         if len(model_choices) > 0:
-            if narrow_queries is None:
-                narrow_queries = set()
+            filters.append({"terms": {DJANGO_CT: model_choices}})
 
-            narrow_queries.add('%s:(%s)' % (DJANGO_CT, ' OR '.join(model_choices)))
-
-        if narrow_queries:
-            kwargs['query'].setdefault('filtered', {})
-            kwargs['query']['filtered'].setdefault('filter', {})
-            kwargs['query']['filtered']['filter'] = {
+        for q in narrow_queries:
+            filters.append({
                 'fquery': {
                     'query': {
                         'query_string': {
-                            'query': u' AND '.join(list(narrow_queries)),
+                            'query': q
                         },
                     },
                     '_cache': True,
                 }
-            }
+            })
 
         if within is not None:
             from haystack.utils.geo import generate_bounding_box
 
-            ((min_lat, min_lng), (max_lat, max_lng)) = generate_bounding_box(within['point_1'], within['point_2'])
+            ((south, west), (north, east)) = generate_bounding_box(within['point_1'], within['point_2'])
             within_filter = {
                 "geo_bounding_box": {
                     within['field']: {
                         "top_left": {
-                            "lat": max_lat,
-                            "lon": max_lng
+                            "lat": north,
+                            "lon": west
                         },
                         "bottom_right": {
-                            "lat": min_lat,
-                            "lon": min_lng
+                            "lat": south,
+                            "lon": east
                         }
                     }
                 },
             }
-            kwargs['query'].setdefault('filtered', {})
-            kwargs['query']['filtered'].setdefault('filter', {})
-            if kwargs['query']['filtered']['filter']:
-                compound_filter = {
-                    "and": [
-                        kwargs['query']['filtered']['filter'],
-                        within_filter,
-                    ]
-                }
-                kwargs['query']['filtered']['filter'] = compound_filter
-            else:
-                kwargs['query']['filtered']['filter'] = within_filter
+            filters.append(within_filter)
 
         if dwithin is not None:
             lng, lat = dwithin['point'].get_coords()
@@ -439,23 +449,15 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
                     }
                 }
             }
-            kwargs['query'].setdefault('filtered', {})
-            kwargs['query']['filtered'].setdefault('filter', {})
-            if kwargs['query']['filtered']['filter']:
-                compound_filter = {
-                    "and": [
-                        kwargs['query']['filtered']['filter'],
-                        dwithin_filter
-                    ]
-                }
-                kwargs['query']['filtered']['filter'] = compound_filter
-            else:
-                kwargs['query']['filtered']['filter'] = dwithin_filter
+            filters.append(dwithin_filter)
 
-        # Remove the "filtered" key if we're not filtering. Otherwise,
-        # Elasticsearch will blow up.
-        if not kwargs['query']['filtered'].get('filter'):
-            kwargs['query'] = kwargs['query']['filtered']['query']
+        # if we want to filter, change the query type to filteres
+        if filters:
+            kwargs["query"] = {"filtered": {"query": kwargs.pop("query")}}
+            if len(filters) == 1:
+                kwargs['query']['filtered']["filter"] = filters[0]
+            else:
+                kwargs['query']['filtered']["filter"] = {"bool": {"must": filters}}
 
         return kwargs
 
@@ -473,24 +475,33 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
         search_kwargs = self.build_search_kwargs(query_string, **kwargs)
         search_kwargs['from'] = kwargs.get('start_offset', 0)
 
+        order_fields = set()
+        for order in search_kwargs.get('sort', []):
+            for key in order.keys():
+                order_fields.add(key)
+
+        geo_sort = '_geo_distance' in order_fields
+
         end_offset = kwargs.get('end_offset')
         start_offset = kwargs.get('start_offset', 0)
         if end_offset is not None and end_offset > start_offset:
             search_kwargs['size'] = end_offset - start_offset
 
         try:
-            raw_results = self.conn.search(search_kwargs,
+            raw_results = self.conn.search(body=search_kwargs,
                                            index=self.index_name,
                                            doc_type='modelresult')
-        except (requests.RequestException, pyelasticsearch.ElasticHttpError), e:
+        except elasticsearch.TransportError as e:
             if not self.silently_fail:
                 raise
 
             self.log.error("Failed to query Elasticsearch using '%s': %s", query_string, e)
             raw_results = {}
 
-        return self._process_results(raw_results, highlight=kwargs.get('highlight'),
-                                     result_class=kwargs.get('result_class', SearchResult))
+        return self._process_results(raw_results,
+            highlight=kwargs.get('highlight'),
+            result_class=kwargs.get('result_class', SearchResult),
+            distance_point=kwargs.get('distance_point'), geo_sort=geo_sort)
 
     def more_like_this(self, model_instance, additional_query_string=None,
                        start_offset=0, end_offset=None, models=None,
@@ -517,8 +528,8 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
         doc_id = get_identifier(model_instance)
 
         try:
-            raw_results = self.conn.more_like_this(self.index_name, 'modelresult', doc_id, [field_name], **params)
-        except (requests.RequestException, pyelasticsearch.ElasticHttpError), e:
+            raw_results = self.conn.mlt(index=self.index_name, doc_type='modelresult', id=doc_id, mlt_fields=[field_name], **params)
+        except elasticsearch.TransportError as e:
             if not self.silently_fail:
                 raise
 
@@ -527,7 +538,9 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
 
         return self._process_results(raw_results, result_class=result_class)
 
-    def _process_results(self, raw_results, highlight=False, result_class=None):
+    def _process_results(self, raw_results, highlight=False,
+                         result_class=None, distance_point=None,
+                         geo_sort=False):
         from haystack import connections
         results = []
         hits = raw_results.get('hits', {}).get('total', 0)
@@ -536,6 +549,11 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
 
         if result_class is None:
             result_class = SearchResult
+
+        if self.include_spelling and 'suggest' in raw_results:
+            raw_suggest = raw_results['suggest'].get('suggest')
+            if raw_suggest:
+                spelling_suggestion = ' '.join([word['text'] if len(word['options']) == 0 else word['options'][0]['text'] for word in raw_suggest])
 
         if 'facets' in raw_results:
             facets = {
@@ -572,13 +590,22 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
                     if string_key in index.fields and hasattr(index.fields[string_key], 'convert'):
                         additional_fields[string_key] = index.fields[string_key].convert(value)
                     else:
-                        additional_fields[string_key] = self.conn.to_python(value)
+                        additional_fields[string_key] = self._to_python(value)
 
                 del(additional_fields[DJANGO_CT])
                 del(additional_fields[DJANGO_ID])
 
                 if 'highlight' in raw_result:
                     additional_fields['highlighted'] = raw_result['highlight'].get(content_field, '')
+
+                if distance_point:
+                    additional_fields['_point_of_origin'] = distance_point
+
+                    if geo_sort and raw_result.get('sort'):
+                        from haystack.utils.geo import Distance
+                        additional_fields['_distance'] = Distance(km=float(raw_result['sort'][0]))
+                    else:
+                        additional_fields['_distance'] = None
 
                 result = result_class(app_label, model_name, source[DJANGO_ID], raw_result['_score'], **additional_fields)
                 results.append(result)
@@ -594,57 +621,105 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
 
     def build_schema(self, fields):
         content_field_name = ''
-        mapping = {}
+        mapping = {
+            DJANGO_CT: {'type': 'string', 'index': 'not_analyzed', 'include_in_all': False},
+            DJANGO_ID: {'type': 'string', 'index': 'not_analyzed', 'include_in_all': False},
+        }
 
         for field_name, field_class in fields.items():
-            field_mapping = {
-                'boost': field_class.boost,
-                'index': 'analyzed',
-                'store': 'yes',
-                'type': 'string',
-            }
+            field_mapping = FIELD_MAPPINGS.get(field_class.field_type, DEFAULT_FIELD_MAPPING).copy()
+            if field_class.boost != 1.0:
+                field_mapping['boost'] = field_class.boost
 
             if field_class.document is True:
                 content_field_name = field_class.index_fieldname
 
-            # DRL_FIXME: Perhaps move to something where, if none of these
-            #            checks succeed, call a custom method on the form that
-            #            returns, per-backend, the right type of storage?
-            if field_class.field_type in ['date', 'datetime']:
-                field_mapping['type'] = 'date'
-            elif field_class.field_type == 'integer':
-                field_mapping['type'] = 'long'
-            elif field_class.field_type == 'float':
-                field_mapping['type'] = 'float'
-            elif field_class.field_type == 'boolean':
-                field_mapping['type'] = 'boolean'
-            elif field_class.field_type == 'ngram':
-                field_mapping['analyzer'] = "ngram_analyzer"
-            elif field_class.field_type == 'edge_ngram':
-                field_mapping['analyzer'] = "edgengram_analyzer"
-            elif field_class.field_type == 'location':
-                field_mapping['type'] = 'geo_point'
-
-            # The docs claim nothing is needed for multivalue...
-            # if field_class.is_multivalued:
-            #     field_data['multi_valued'] = 'true'
-
-            if field_class.stored is False:
-                field_mapping['store'] = 'no'
-
             # Do this last to override `text` fields.
-            if field_class.indexed is False or hasattr(field_class, 'facet_for'):
-                field_mapping['index'] = 'not_analyzed'
-
-            if field_mapping['type'] == 'string' and field_class.indexed:
-                field_mapping["term_vector"] = "with_positions_offsets"
-
-                if not hasattr(field_class, 'facet_for') and not field_class.field_type in('ngram', 'edge_ngram'):
-                    field_mapping["analyzer"] = "snowball"
+            if field_mapping['type'] == 'string':
+                if field_class.indexed is False or hasattr(field_class, 'facet_for'):
+                    field_mapping['index'] = 'not_analyzed'
+                    del field_mapping['analyzer']
 
             mapping[field_class.index_fieldname] = field_mapping
 
         return (content_field_name, mapping)
+
+    def _iso_datetime(self, value):
+        """
+        If value appears to be something datetime-like, return it in ISO format.
+
+        Otherwise, return None.
+        """
+        if hasattr(value, 'strftime'):
+            if hasattr(value, 'hour'):
+                return value.isoformat()
+            else:
+                return '%sT00:00:00' % value.isoformat()
+
+    def _from_python(self, value):
+        """Convert more Python data types to ES-understandable JSON."""
+        iso = self._iso_datetime(value)
+        if iso:
+            return iso
+        elif isinstance(value, six.binary_type):
+            # TODO: Be stricter.
+            return six.text_type(value, errors='replace')
+        elif isinstance(value, set):
+            return list(value)
+        return value
+
+    def _to_python(self, value):
+        """Convert values from ElasticSearch to native Python values."""
+        if isinstance(value, (int, float, complex, list, tuple, bool)):
+            return value
+
+        if isinstance(value, six.string_types):
+            possible_datetime = DATETIME_REGEX.search(value)
+
+            if possible_datetime:
+                date_values = possible_datetime.groupdict()
+
+                for dk, dv in date_values.items():
+                    date_values[dk] = int(dv)
+
+                return datetime.datetime(
+                    date_values['year'], date_values['month'],
+                    date_values['day'], date_values['hour'],
+                    date_values['minute'], date_values['second'])
+
+        try:
+            # This is slightly gross but it's hard to tell otherwise what the
+            # string's original type might have been. Be careful who you trust.
+            converted_value = eval(value)
+
+            # Try to handle most built-in types.
+            if isinstance(
+                    converted_value,
+                    (int, list, tuple, set, dict, float, complex)):
+                return converted_value
+        except Exception:
+            # If it fails (SyntaxError or its ilk) or we don't trust it,
+            # continue on.
+            pass
+
+        return value
+
+# DRL_FIXME: Perhaps move to something where, if none of these
+#            match, call a custom method on the form that returns, per-backend,
+#            the right type of storage?
+DEFAULT_FIELD_MAPPING = {'type': 'string', 'analyzer': 'snowball'}
+FIELD_MAPPINGS = {
+    'edge_ngram': {'type': 'string', 'analyzer': 'edgengram_analyzer'},
+    'ngram':      {'type': 'string', 'analyzer': 'ngram_analyzer'},
+    'date':       {'type': 'date'},
+    'datetime':   {'type': 'date'},
+
+    'location':   {'type': 'geo_point'},
+    'boolean':    {'type': 'boolean'},
+    'float':      {'type': 'float'},
+    'long':       {'type': 'long'},
+    'integer':    {'type': 'long'},
+}
 
 
 # Sucks that this is almost an exact copy of what's in the Solr backend,
@@ -681,7 +756,7 @@ class ElasticsearchSearchQuery(BaseSearchQuery):
             if hasattr(value, 'values_list'):
                 value = list(value)
 
-            if isinstance(value, basestring):
+            if isinstance(value, six.string_types):
                 # It's not an ``InputType``. Assume ``Clean``.
                 value = Clean(value)
             else:
@@ -692,7 +767,7 @@ class ElasticsearchSearchQuery(BaseSearchQuery):
 
         if not isinstance(prepared_value, (set, list, tuple)):
             # Then convert whatever we get back to what pysolr wants if needed.
-            prepared_value = self.backend.conn.from_python(prepared_value)
+            prepared_value = self.backend._from_python(prepared_value)
 
         # 'content' is a special reserved word, much like 'pk' in
         # Django's ORM layer. It indicates 'no special field'.
@@ -721,11 +796,11 @@ class ElasticsearchSearchQuery(BaseSearchQuery):
                     # Iterate over terms & incorportate the converted form of each into the query.
                     terms = []
 
-                    if isinstance(prepared_value, basestring):
+                    if isinstance(prepared_value, six.string_types):
                         for possible_value in prepared_value.split(' '):
-                            terms.append(filter_types[filter_type] % self.backend.conn.from_python(possible_value))
+                            terms.append(filter_types[filter_type] % self.backend._from_python(possible_value))
                     else:
-                        terms.append(filter_types[filter_type] % self.backend.conn.from_python(prepared_value))
+                        terms.append(filter_types[filter_type] % self.backend._from_python(prepared_value))
 
                     if len(terms) == 1:
                         query_frag = terms[0]
@@ -735,12 +810,12 @@ class ElasticsearchSearchQuery(BaseSearchQuery):
                 in_options = []
 
                 for possible_value in prepared_value:
-                    in_options.append(u'"%s"' % self.backend.conn.from_python(possible_value))
+                    in_options.append(u'"%s"' % self.backend._from_python(possible_value))
 
                 query_frag = u"(%s)" % " OR ".join(in_options)
             elif filter_type == 'range':
-                start = self.backend.conn.from_python(prepared_value[0])
-                end = self.backend.conn.from_python(prepared_value[1])
+                start = self.backend._from_python(prepared_value[0])
+                end = self.backend._from_python(prepared_value[1])
                 query_frag = u'["%s" TO "%s"]' % (start, end)
             elif filter_type == 'exact':
                 if value.input_type_name == 'exact':
@@ -754,8 +829,9 @@ class ElasticsearchSearchQuery(BaseSearchQuery):
 
                 query_frag = filter_types[filter_type] % prepared_value
 
-        if len(query_frag) and not query_frag.startswith('(') and not query_frag.endswith(')'):
-            query_frag = "(%s)" % query_frag
+        if len(query_frag) and not isinstance(value, Raw):
+            if not query_frag.startswith('(') and not query_frag.endswith(')'):
+                query_frag = "(%s)" % query_frag
 
         return u"%s%s" % (index_fieldname, query_frag)
 
@@ -766,7 +842,7 @@ class ElasticsearchSearchQuery(BaseSearchQuery):
         kwarg_bits = []
 
         for key in sorted(kwargs.keys()):
-            if isinstance(kwargs[key], basestring) and ' ' in kwargs[key]:
+            if isinstance(kwargs[key], six.string_types) and ' ' in kwargs[key]:
                 kwarg_bits.append(u"%s='%s'" % (key, kwargs[key]))
             else:
                 kwarg_bits.append(u"%s=%s" % (key, kwargs[key]))
@@ -806,7 +882,7 @@ class ElasticsearchSearchQuery(BaseSearchQuery):
             search_kwargs['end_offset'] = self.end_offset
 
         if self.facets:
-            search_kwargs['facets'] = list(self.facets)
+            search_kwargs['facets'] = self.facets
 
         if self.fields:
             search_kwargs['fields'] = self.fields
@@ -835,6 +911,10 @@ class ElasticsearchSearchQuery(BaseSearchQuery):
         """Builds and executes the query. Returns a list of search results."""
         final_query = self.build_query()
         search_kwargs = self.build_params(spelling_query, **kwargs)
+
+        if kwargs:
+            search_kwargs.update(kwargs)
+
         results = self.backend.search(final_query, **search_kwargs)
         self._results = results.get('results', [])
         self._hit_count = results.get('hits', 0)
@@ -850,6 +930,7 @@ class ElasticsearchSearchQuery(BaseSearchQuery):
         search_kwargs = {
             'start_offset': self.start_offset,
             'result_class': self.result_class,
+            'models': self.models
         }
 
         if self.end_offset is not None:
